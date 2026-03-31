@@ -1,0 +1,15 @@
+{
+  "name": "skin-societe-meta-lead-automation",
+  "version": "1.0.0",
+  "description": "Meta Lead Ads to Twilio SMS automation for SKIN SOCIETE",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "twilio": "^4.23.0",
+    "node-fetch": "^2.7.0",
+    "dotenv": "^16.4.5"
+  }
+}
