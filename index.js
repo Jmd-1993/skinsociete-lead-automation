@@ -43,13 +43,13 @@ const CLINICS = {
   [COTTESLOE_FORM_ID]: {
     name: 'Cottesloe',
     receptionPhone: COTTESLOE_RECEPTION_PHONE,
-    bookingUrl: 'https://skinsociete.com.au/skin-needling?location=cottesloe',
+    bookingUrl: 'http://phr.st/T5Bby',
     address: 'Cottesloe, Perth WA'
   },
   [ROCKINGHAM_FORM_ID]: {
     name: 'Rockingham',
     receptionPhone: ROCKINGHAM_RECEPTION_PHONE,
-    bookingUrl: 'https://skinsociete.com.au/skin-needling?location=rockingham',
+    bookingUrl: 'http://phore.st/jhoV9',
     address: 'Rockingham, Perth WA'
   }
 };
@@ -58,7 +58,7 @@ const CLINICS = {
 const DEFAULT_CLINIC = {
   name: 'SKIN SOCIETE',
   receptionPhone: COTTESLOE_RECEPTION_PHONE,
-  bookingUrl: 'https://skinsociete.com.au/skin-needling',
+  bookingUrl: 'http://phr.st/T5Bby',
   address: 'Perth WA'
 };
 
