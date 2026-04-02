@@ -1,14 +1,15 @@
 /**
  * SKIN SOCIETE — Meta Lead Ads → Twilio SMS Automation
- * v2.0 — POLLING + WEBHOOK dual approach
+ * v3.0 — RESTART-SAFE POLLING + WEBHOOK
  *
  * PRIMARY: Polls Meta Graph API every 2 minutes for new leads
  * BACKUP:  Webhook endpoint still active (for when app gets published)
  *
- * On startup:
- *   1. Seeds "already processed" set with all current leads (avoids re-SMSing)
- *   2. Starts polling loop every 2 minutes
- *   3. Any NEW lead found → instant SMS to lead + Josh
+ * v3.0 FIX: On startup, only seeds leads older than SEED_THRESHOLD_MS.
+ * Any lead created within the threshold window gets SMS'd immediately.
+ * This means restarts/redeploys NEVER silently swallow recent leads.
+ *
+ * Also adds a self-ping keep-alive to prevent Railway from sleeping.
  */
 
 require('dotenv').config();
@@ -33,7 +34,9 @@ const {
   COTTESLOE_FORM_ID,
   ROCKINGHAM_FORM_ID,
   PORT = 3000,
-  POLL_INTERVAL_MS = 120000 // 2 minutes default
+  POLL_INTERVAL_MS = 120000, // 2 minutes default
+  SEED_THRESHOLD_MS = 600000, // 10 minutes — leads newer than this get SMS on restart
+  RAILWAY_URL // set this to your Railway public URL for keep-alive pings
 } = process.env;
 
 // Twilio client
@@ -69,6 +72,7 @@ const processedLeads = new Set();
 let pollCount = 0;
 let lastPollTime = null;
 let totalLeadsSent = 0;
+let serverStartTime = null;
 
 // ============================================================
 // SMS TEMPLATES
@@ -117,6 +121,65 @@ Auto-SMS with booking link already sent to client.`;
 }
 
 // ============================================================
+// CORE: Send SMS to a lead + notify reception
+// ============================================================
+
+async function processLead(extracted, clinic, source) {
+  console.log(`\n🆕 NEW LEAD DETECTED — ${source}`);
+  console.log(`   Clinic: ${clinic.name}`);
+  console.log(`   Name: ${extracted.fullName}`);
+  console.log(`   Phone: ${extracted.phone}`);
+  console.log(`   Email: ${extracted.email}`);
+  console.log(`   Preferred: ${extracted.preferredTime}`);
+  console.log(`   Created: ${extracted.createdTime}`);
+  console.log(`   Lead ID: ${extracted.id}`);
+
+  let leadSmsSent = false;
+  let receptionSmsSent = false;
+
+  // Send SMS to the lead
+  if (extracted.phone) {
+    const formattedPhone = formatAustralianPhone(extracted.phone);
+    if (formattedPhone) {
+      const leadMessage = getLeadSMS(extracted.fullName, clinic, extracted.preferredTime);
+      const sid = await sendSMS(formattedPhone, leadMessage);
+      if (sid) {
+        console.log(`   ✅ SMS sent to lead: ${formattedPhone} (${sid})`);
+        leadSmsSent = true;
+      } else {
+        console.log(`   ❌ FAILED to send SMS to lead: ${formattedPhone}`);
+      }
+    } else {
+      console.log(`   ⚠️ Could not format phone: ${extracted.phone}`);
+    }
+  } else {
+    console.log(`   ⚠️ No phone number — cannot SMS lead`);
+  }
+
+  // Send notification to reception
+  if (clinic.receptionPhone) {
+    const receptionMessage = getReceptionSMS(
+      extracted.fullName,
+      extracted.phone,
+      extracted.email,
+      clinic,
+      extracted.preferredTime
+    );
+    const sid = await sendSMS(clinic.receptionPhone, receptionMessage);
+    if (sid) {
+      console.log(`   ✅ Reception notified (${sid})`);
+      receptionSmsSent = true;
+    } else {
+      console.log(`   ❌ FAILED to notify reception`);
+    }
+  }
+
+  totalLeadsSent++;
+  console.log(`   ✅ Lead fully processed (lead SMS: ${leadSmsSent}, reception SMS: ${receptionSmsSent})\n`);
+  return { leadSmsSent, receptionSmsSent };
+}
+
+// ============================================================
 // POLLING SYSTEM — checks Meta API for new leads
 // ============================================================
 
@@ -160,11 +223,23 @@ function extractLeadFields(lead) {
 }
 
 /**
- * Seed the processed set with all current leads on startup
- * This prevents re-SMSing everyone when the server restarts
+ * v3.0 RESTART-SAFE SEED
+ *
+ * Only seeds leads OLDER than SEED_THRESHOLD_MS (default 10 mins).
+ * Recent leads (within threshold) are treated as NEW and get SMS.
+ * This prevents the bug where a restart silently swallows all pending leads.
  */
-async function seedProcessedLeads() {
-  console.log('🌱 Seeding processed leads from existing data...');
+async function seedAndCatchUp() {
+  const seedThreshold = parseInt(SEED_THRESHOLD_MS) || 600000;
+  const now = new Date();
+  const cutoff = new Date(now.getTime() - seedThreshold);
+
+  console.log('🌱 Smart seed starting...');
+  console.log(`   Current time: ${now.toISOString()}`);
+  console.log(`   Seed threshold: ${seedThreshold / 1000}s`);
+  console.log(`   Cutoff: ${cutoff.toISOString()}`);
+  console.log(`   Leads OLDER than cutoff → mark as processed (no SMS)`);
+  console.log(`   Leads NEWER than cutoff → send SMS now (catch-up)\n`);
 
   const forms = [
     { id: COTTESLOE_FORM_ID, name: 'Cottesloe' },
@@ -172,6 +247,7 @@ async function seedProcessedLeads() {
   ];
 
   let totalSeeded = 0;
+  let totalCaughtUp = 0;
 
   for (const form of forms) {
     if (!form.id) {
@@ -180,15 +256,38 @@ async function seedProcessedLeads() {
     }
 
     const leads = await fetchFormLeads(form.id);
+    const clinic = CLINICS[form.id] || DEFAULT_CLINIC;
+    let seeded = 0;
+    let caughtUp = 0;
+
     for (const lead of leads) {
-      processedLeads.add(lead.id);
-      totalSeeded++;
+      const leadTime = new Date(lead.created_time);
+
+      if (leadTime < cutoff) {
+        // Old lead — seed as processed, no SMS
+        processedLeads.add(lead.id);
+        seeded++;
+      } else {
+        // Recent lead — might have been missed during downtime
+        if (!processedLeads.has(lead.id)) {
+          processedLeads.add(lead.id);
+          const extracted = extractLeadFields(lead);
+          console.log(`   🔄 CATCH-UP: ${extracted.fullName} (${form.name}) — created ${lead.created_time}`);
+          await processLead(extracted, clinic, `Startup catch-up (${form.name})`);
+          caughtUp++;
+        }
+      }
     }
-    console.log(`  ${form.name}: ${leads.length} existing leads marked as processed`);
+
+    console.log(`   ${form.name}: ${seeded} seeded (old) | ${caughtUp} caught up (recent)`);
+    totalSeeded += seeded;
+    totalCaughtUp += caughtUp;
   }
 
-  console.log(`✅ Seeded ${totalSeeded} total leads — these will NOT receive SMS`);
-  console.log(`   (Only NEW leads from this point forward will trigger SMS)`);
+  console.log(`\n✅ Smart seed complete — ${totalSeeded} old leads seeded, ${totalCaughtUp} recent leads caught up with SMS`);
+  if (totalCaughtUp > 0) {
+    console.log(`   ⚡ ${totalCaughtUp} lead(s) received SMS that would have been missed in v2.0!`);
+  }
 }
 
 /**
@@ -213,64 +312,18 @@ async function pollForNewLeads() {
     const clinic = CLINICS[form.id] || DEFAULT_CLINIC;
 
     for (const lead of leads) {
-      // Skip if already processed
       if (processedLeads.has(lead.id)) continue;
 
-      // NEW LEAD FOUND!
+      // NEW LEAD FOUND
       processedLeads.add(lead.id);
       newLeadsThisPoll++;
-      totalLeadsSent++;
 
       const extracted = extractLeadFields(lead);
-      console.log(`\n🆕 NEW LEAD DETECTED — Poll #${pollCount}`);
-      console.log(`   Clinic: ${clinic.name}`);
-      console.log(`   Name: ${extracted.fullName}`);
-      console.log(`   Phone: ${extracted.phone}`);
-      console.log(`   Email: ${extracted.email}`);
-      console.log(`   Preferred: ${extracted.preferredTime}`);
-      console.log(`   Created: ${extracted.createdTime}`);
-      console.log(`   Lead ID: ${extracted.id}`);
-
-      // Send SMS to the lead
-      if (extracted.phone) {
-        const formattedPhone = formatAustralianPhone(extracted.phone);
-        if (formattedPhone) {
-          const leadMessage = getLeadSMS(extracted.fullName, clinic, extracted.preferredTime);
-          const sid = await sendSMS(formattedPhone, leadMessage);
-          if (sid) {
-            console.log(`   ✅ SMS sent to lead: ${formattedPhone} (${sid})`);
-          } else {
-            console.log(`   ❌ FAILED to send SMS to lead: ${formattedPhone}`);
-          }
-        } else {
-          console.log(`   ⚠️ Could not format phone: ${extracted.phone}`);
-        }
-      } else {
-        console.log(`   ⚠️ No phone number — cannot SMS lead`);
-      }
-
-      // Send notification to Josh (reception)
-      if (clinic.receptionPhone) {
-        const receptionMessage = getReceptionSMS(
-          extracted.fullName,
-          extracted.phone,
-          extracted.email,
-          clinic,
-          extracted.preferredTime
-        );
-        const sid = await sendSMS(clinic.receptionPhone, receptionMessage);
-        if (sid) {
-          console.log(`   ✅ Josh notified (${sid})`);
-        } else {
-          console.log(`   ❌ FAILED to notify Josh`);
-        }
-      }
-
-      console.log(`   ✅ Lead fully processed\n`);
+      await processLead(extracted, clinic, `Poll #${pollCount}`);
     }
   }
 
-  // Quiet log for no-activity polls (every 10th poll to avoid log spam)
+  // Log summary
   if (newLeadsThisPoll === 0 && pollCount % 10 === 0) {
     console.log(`📊 Poll #${pollCount} — No new leads | ${processedLeads.size} tracked | ${totalLeadsSent} SMS sent total | ${pollStart.toISOString()}`);
   } else if (newLeadsThisPoll > 0) {
@@ -298,6 +351,26 @@ function startPolling() {
       console.error('❌ Polling error:', err.message);
     });
   }, intervalMs);
+}
+
+// ============================================================
+// KEEP-ALIVE — prevents Railway from sleeping the server
+// ============================================================
+
+function startKeepAlive() {
+  const railwayUrl = RAILWAY_URL || `http://localhost:${PORT}`;
+  const pingInterval = 10 * 60 * 1000; // every 10 minutes
+
+  setInterval(async () => {
+    try {
+      await fetch(`${railwayUrl}/`);
+      // Silent — no log spam for keep-alive
+    } catch (err) {
+      console.error('⚠️ Keep-alive ping failed:', err.message);
+    }
+  }, pingInterval);
+
+  console.log(`🏓 Keep-alive enabled — pinging ${railwayUrl} every 10 minutes`);
 }
 
 // ============================================================
@@ -336,13 +409,11 @@ app.post('/webhook', async (req, res) => {
           const leadData = change.value;
           console.log(`📩 Webhook received — Form: ${leadData.form_id}, Lead: ${leadData.leadgen_id}`);
 
-          // Check if polling already handled this lead
           if (processedLeads.has(leadData.leadgen_id)) {
             console.log(`   ⏭️ Already processed by polling — skipping`);
             continue;
           }
 
-          // Process via original webhook flow
           processWebhookLead(leadData).catch(err => {
             console.error('❌ Error processing webhook lead:', err);
           });
@@ -354,13 +425,9 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-/**
- * Process a lead from webhook (original flow — backup for when app is published)
- */
 async function processWebhookLead(leadData) {
   const { leadgen_id, form_id } = leadData;
 
-  // Mark as processed immediately to prevent duplicate from polling
   processedLeads.add(leadgen_id);
 
   const leadDetails = await fetchLeadDetails(leadgen_id);
@@ -374,37 +441,19 @@ async function processWebhookLead(leadData) {
     fields[field.name] = field.values?.[0] || '';
   }
 
-  const leadName = fields.full_name || fields.first_name || '';
-  const leadPhone = fields.phone_number || '';
-  const leadEmail = fields.email || '';
-  const preferredTime = fields.preferred_time || '';
-
   const clinic = CLINICS[form_id] || DEFAULT_CLINIC;
+  const extracted = {
+    id: leadgen_id,
+    createdTime: leadDetails.created_time,
+    fullName: fields.full_name || fields.first_name || '',
+    phone: fields.phone_number || '',
+    email: fields.email || '',
+    preferredTime: fields.preferred_time || ''
+  };
 
-  console.log(`👤 Webhook Lead: ${leadName} | Phone: ${leadPhone} | Clinic: ${clinic.name}`);
-
-  if (leadPhone) {
-    const formattedPhone = formatAustralianPhone(leadPhone);
-    if (formattedPhone) {
-      const leadMessage = getLeadSMS(leadName, clinic, preferredTime);
-      await sendSMS(formattedPhone, leadMessage);
-      console.log(`✅ SMS sent to lead: ${formattedPhone}`);
-    }
-  }
-
-  if (clinic.receptionPhone) {
-    const receptionMessage = getReceptionSMS(leadName, leadPhone, leadEmail, clinic, preferredTime);
-    await sendSMS(clinic.receptionPhone, receptionMessage);
-    console.log(`✅ Reception notified: ${clinic.name}`);
-  }
-
-  totalLeadsSent++;
-  console.log(`✅ Webhook lead fully processed: ${leadName} → ${clinic.name}`);
+  await processLead(extracted, clinic, 'Webhook');
 }
 
-/**
- * Fetch individual lead details (used by webhook flow)
- */
 async function fetchLeadDetails(leadgenId) {
   try {
     const url = `https://graph.facebook.com/v19.0/${leadgenId}?access_token=${META_ACCESS_TOKEN}`;
@@ -465,8 +514,9 @@ function formatAustralianPhone(phone) {
 app.get('/', (req, res) => {
   res.json({
     status: 'running',
-    service: 'SKIN SOCIETE Lead Automation v2.0',
-    mode: 'POLLING + WEBHOOK',
+    service: 'SKIN SOCIETE Lead Automation v3.0',
+    mode: 'POLLING + WEBHOOK (restart-safe)',
+    server_started: serverStartTime,
     polling: {
       interval_seconds: (parseInt(POLL_INTERVAL_MS) || 120000) / 1000,
       polls_completed: pollCount,
@@ -478,13 +528,11 @@ app.get('/', (req, res) => {
       cottesloe: COTTESLOE_FORM_ID,
       rockingham: ROCKINGHAM_FORM_ID
     },
+    seed_threshold_minutes: (parseInt(SEED_THRESHOLD_MS) || 600000) / 60000,
     timestamp: new Date().toISOString()
   });
 });
 
-/**
- * Test endpoint — simulate a lead
- */
 app.post('/test-lead', async (req, res) => {
   const { name, phone, email, preferred_time, clinic: clinicKey } = req.body;
 
@@ -516,9 +564,6 @@ app.post('/test-lead', async (req, res) => {
   });
 });
 
-/**
- * Manual poll trigger — force an immediate poll check
- */
 app.post('/poll-now', async (req, res) => {
   console.log('🔄 Manual poll triggered via /poll-now');
   try {
@@ -535,16 +580,14 @@ app.post('/poll-now', async (req, res) => {
   }
 });
 
-/**
- * Status of all tracked leads
- */
 app.get('/leads-status', (req, res) => {
   res.json({
     processedLeadIds: Array.from(processedLeads),
     count: processedLeads.size,
     smsSent: totalLeadsSent,
     pollCount,
-    lastPoll: lastPollTime
+    lastPoll: lastPollTime,
+    serverStarted: serverStartTime
   });
 });
 
@@ -553,13 +596,17 @@ app.get('/leads-status', (req, res) => {
 // ============================================================
 
 app.listen(PORT, async () => {
+  serverStartTime = new Date().toISOString();
+
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║  SKIN SOCIETE — Lead Automation Server v2.0     ║
+║  SKIN SOCIETE — Lead Automation Server v3.0     ║
 ║  Running on port ${PORT}                            ║
 ║                                                  ║
 ║  MODE: POLLING (primary) + WEBHOOK (backup)      ║
 ║  Poll interval: ${(parseInt(POLL_INTERVAL_MS) || 120000) / 1000}s                              ║
+║  Seed threshold: ${(parseInt(SEED_THRESHOLD_MS) || 600000) / 60000} minutes                        ║
+║  RESTART-SAFE: Recent leads get SMS on reboot    ║
 ║                                                  ║
 ║  Endpoints:                                      ║
 ║    GET  /           — Health check + stats        ║
@@ -574,9 +621,12 @@ app.listen(PORT, async () => {
   console.log(`  Cottesloe  — Form: ${COTTESLOE_FORM_ID}`);
   console.log(`  Rockingham — Form: ${ROCKINGHAM_FORM_ID}`);
 
-  // STEP 1: Seed existing leads so we don't re-SMS them
-  await seedProcessedLeads();
+  // STEP 1: Smart seed + catch up on recent leads
+  await seedAndCatchUp();
 
   // STEP 2: Start polling for new leads
   startPolling();
+
+  // STEP 3: Keep-alive to prevent Railway sleep
+  startKeepAlive();
 });
